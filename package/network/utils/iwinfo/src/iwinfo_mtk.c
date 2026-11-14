@@ -36,6 +36,12 @@ static int mtk_dev2phy(const char *devname, char *phy, size_t len)
 
 	iwinfo_uci_free();
 
+	/* 极致加固：防止长时间运行后UCI上下文偶发挂起导致查询失败而引发设备脱节断网 */
+	if (ret < 0 && devname[0]) {
+		snprintf(phy, len, "%s", devname);
+		return 0;
+	}
+
 	return ret;
 }
 
@@ -77,59 +83,6 @@ static int mtk_is_ifup(const char *ifname)
 	{
 		if (ifr.ifr_flags & IFF_UP)
 			return 1;
-	}
-
-	return 0;
-}
-
-static int mtk_get_band(const char *dev)
-{
-	struct iwreq wrq;
-	char ifname[IFNAMSIZ];
-	int chband;
-
-	/* get band base on ioctl */
-	if (mtk_dev2phy(dev, ifname, sizeof(ifname)) < 0)
-		return -1;
-
-	if (!mtk_is_ifup(ifname))
-		return -1;
-
-	wrq.u.data.length = sizeof(chband);
-	wrq.u.data.pointer = &chband;
-	wrq.u.data.flags = OID_GET_WIRELESS_BAND;
-
-	if (mtk_ioctl(ifname, RT_PRIV_IOCTL, &wrq) >= 0)
-		return chband;
-
-	return -1;
-}
-
-static int mtk_channel2freq(int channel, enum MTK_CH_BAND band)
-{
-	if (channel < 1)
-		return 0;
-
-	if (band == MTK_CH_BAND_24G)
-	{
-		if (channel == 14)
-			return 2484;
-		else if (channel < 14)
-			return (channel * 5) + 2407;
-	}
-	else if (band == MTK_CH_BAND_5G)
-	{
-		if (channel >= 182 && channel <= 196)
-			return (channel * 5) + 4000;
-		else
-			return (channel * 5) + 5000;
-	}
-	else if (band == MTK_CH_BAND_6G)
-	{
-		if (channel == 2)
-			return 5935;
-		if (channel <= 233)
-			return (channel * 5) + 5950;
 	}
 
 	return 0;
@@ -260,20 +213,36 @@ static int mtk_get_center_chan2(const char *dev, int *buf)
 
 static int mtk_get_frequency(const char *dev, int *buf)
 {
-	int channel, band, freq;
+	int channel;
+	struct iwreq wrq;
+	char ifname[IFNAMSIZ];
 
-	band = mtk_get_band(dev);
-	if (band < 0)
+	if (mtk_dev2phy(dev, ifname, sizeof(ifname)) < 0)
 		return -1;
 
-	if (mtk_get_channel(dev, &channel) < 0)
-		return -1;
+	if (mtk_ioctl(ifname, SIOCGIWFREQ, &wrq) >= 0)
+	{
+		channel = wrq.u.freq.m;
 
-	freq = mtk_channel2freq(channel, band);
-	if (freq)
-		*buf = freq;
+		if (channel <= 0)
+			return -1;
 
-	return 0;
+		if (channel > 14) {
+			if (channel >= 182 && channel <= 196)
+				*buf = 4000 + channel * 5;
+			else
+				*buf = 5000 + channel * 5;
+		} else if (channel == 14) {
+			*buf = 2484;
+		} else {
+			*buf = 2407 + channel * 5;
+		}
+
+		return 0;
+	}
+
+	return -1;
+	
 }
 
 static int mtk_get_txpower(const char *dev, int *buf)
@@ -553,8 +522,6 @@ static int mtk_get_scanlist(const char *dev, char *buf, int *len)
 			return -1;
 		}
 
-		//printf("%s\n", data);
-
 		sscanf(data, "\nTotal=%d", &total);
 
 		strtok(data, "\n");
@@ -645,12 +612,7 @@ static int mtk_get_scanlist(const char *dev, char *buf, int *len)
 				mac + 0, mac + 1, mac + 2, mac + 3, mac + 4, mac + 5);
 
 			sscanf(pos + offsets[SCAN_DATA_SSID_LEN], "%d", &ssid_len);
-			if (ssid_len < 0)
-				ssid_len = 0;
-			if (ssid_len > IWINFO_ESSID_MAX_SIZE)
-				ssid_len = IWINFO_ESSID_MAX_SIZE;
 			memcpy(e->ssid, pos + offsets[SCAN_DATA_SSID], ssid_len);
-			e->ssid[ssid_len] = '\0';
 
 			*len += sizeof(struct iwinfo_scanlist_entry);
 			e++;
@@ -757,22 +719,18 @@ static int mtk_get_hwmodelist(const char *dev, int *buf)
 
 	/* get hwmode base on uci band config */
 	s = iwinfo_uci_get_radio(dev, "mtwifi");
-	if (!s)
-		goto uciout;
-	
-	band = uci_lookup_option_string(uci_ctx, s, "band");
-
-	if (band) {
-		if (!strcmp(band,"2g"))
-			*buf = (IWINFO_80211_N | IWINFO_80211_AX | IWINFO_80211_BE);
-		else if (!strcmp(band,"5g"))
-			*buf = (IWINFO_80211_AC | IWINFO_80211_AX | IWINFO_80211_BE);
-
-		iwinfo_uci_free();
-		return 0;
+	if (s) {
+		band = uci_lookup_option_string(uci_ctx, s, "band");
+		if (band) {
+			if (!strcmp(band,"2g"))
+				*buf = (IWINFO_80211_N | IWINFO_80211_AX | IWINFO_80211_BE);
+			else if (!strcmp(band,"5g"))
+				*buf = (IWINFO_80211_AC | IWINFO_80211_AX | IWINFO_80211_BE);
+			
+			iwinfo_uci_free();
+			return 0;
+		}
 	}
-
-uciout:
 	iwinfo_uci_free();
 
 	/* get hwmode base on iwrange */
@@ -812,24 +770,20 @@ static int mtk_get_htmodelist(const char *dev, int *buf)
 
 	/* get htmode base on uci band config */
 	s = iwinfo_uci_get_radio(dev, "mtwifi");
-	if (!s)
-		goto uciout;
-	
-	band = uci_lookup_option_string(uci_ctx, s, "band");
-
-	if (band) {
-		if (!strcmp(band,"2g"))
-			*buf = (IWINFO_HTMODE_HT20 | IWINFO_HTMODE_HT40 | IWINFO_HTMODE_HE20 | IWINFO_HTMODE_HE40 | IWINFO_HTMODE_EHT20 | IWINFO_HTMODE_EHT40);
-		else if (!strcmp(band,"5g"))
-			*buf = (IWINFO_HTMODE_VHT20 | IWINFO_HTMODE_VHT40 | IWINFO_HTMODE_VHT80 | IWINFO_HTMODE_VHT160
-			| IWINFO_HTMODE_HE20 | IWINFO_HTMODE_HE40 | IWINFO_HTMODE_HE80 | IWINFO_HTMODE_HE160
-			| IWINFO_HTMODE_EHT20 | IWINFO_HTMODE_EHT40 | IWINFO_HTMODE_EHT80 | IWINFO_HTMODE_EHT160);
-
-		iwinfo_uci_free();
-		return 0;
+	if (s) {
+		band = uci_lookup_option_string(uci_ctx, s, "band");
+		if (band) {
+			if (!strcmp(band,"2g"))
+				*buf = (IWINFO_HTMODE_HT20 | IWINFO_HTMODE_HT40 | IWINFO_HTMODE_HE20 | IWINFO_HTMODE_HE40 | IWINFO_HTMODE_EHT20 | IWINFO_HTMODE_EHT40);
+			else if (!strcmp(band,"5g"))
+				*buf = (IWINFO_HTMODE_VHT20 | IWINFO_HTMODE_VHT40 | IWINFO_HTMODE_VHT80 | IWINFO_HTMODE_VHT160
+				| IWINFO_HTMODE_HE20 | IWINFO_HTMODE_HE40 | IWINFO_HTMODE_HE80 | IWINFO_HTMODE_HE160
+				| IWINFO_HTMODE_EHT20 | IWINFO_HTMODE_EHT40 | IWINFO_HTMODE_EHT80 | IWINFO_HTMODE_EHT160);
+			
+			iwinfo_uci_free();
+			return 0;
+		}
 	}
-
-uciout:
 	iwinfo_uci_free();
 
 	/* get htmode base on iwrange */
@@ -1050,7 +1004,6 @@ static int mtk_get_l1profile_attr(const char *attr, char *data, int len)
 
 		if (!strcmp(key, attr))
 		{
-			//printf("l1profile key=%s, val=%s\n", key, val);
 			snprintf(data, len, "%s", val);
 			fclose(fp);
 			return 0;
